@@ -1,0 +1,8 @@
+findMotifsGenome.pl \
+    "/results/lncRNA_dmPeaks.bed" \
+    mm10 \
+    "/results/HOMER_NOV2026/dm_all_bgAll_given_6" \
+    -rna \
+    -size given \
+    -p 15 \
+    -len 6
