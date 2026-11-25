@@ -1,0 +1,281 @@
+#### LIBRARIES
+library(Rsamtools)
+library(GenomicRanges)
+library(GenomicAlignments)
+library(rtracklayer)
+library(data.table)
+library(RADAR)
+library(tidyverse)
+library(reshape2)
+library(dplyr)
+library(pheatmap)
+
+########### FILES
+geneType <- fread("/referenceGenomes/geneList_type.txt",
+                  header = FALSE,
+                  stringsAsFactors = FALSE)
+names(geneType) <- c("Gene_ID","Gene_Name","Gene_Type")
+
+########### ORIGINAL RADAR OBJECT CREATION
+merip <- countReads(
+  samplenames = c("Sample_1","Sample_2","Sample_3","Sample_4","Sample_5","Sample_6","Sample_7","Sample_8","Sample_9","Sample_10"),
+  gtf = "gencode.vM36.annotation.gtf", 
+  fragmentLength = 150,
+  bamFolder="/results/miceBams_all/",
+  outputDir="/radar_results/",
+  modification = "m6A",
+  binSize = 50,
+  strandToKeep = "opposite",
+  paired = TRUE,
+  threads = 60,
+  saveOutput = T
+)
+
+########### RADAR RESULT ANALYSIS
+#merip <- readRDS(path)
+#print(paste0(filePrefix,"_DATA COLLECTED"))
+
+merip <- normalizeLibrary(merip,boxPlot = TRUE)
+print("NORMALISED")
+
+merip <- adjustExprLevel(merip)
+print("EXP ADJUSTED")
+
+variable(merip) <- data.frame(Group = c(rep("db/+",5),rep("db/db",5)))
+print("VARIABLES/ GROUPS ADDED")
+
+merip <- filterBins(merip,minCountsCutOff = 15)
+print("FILTERED")
+
+merip <- diffIP(merip)
+print("DIFF")
+
+results_all <- reportResult(merip, cutoff = 0.5, Beta_cutoff = 0.5)
+results_dmg_all <- RADAR::results(results_all)
+
+results_dmg_all <-  as.data.table(merge(results_dmg_all,
+            geneType,
+            by.x = "name",
+            by.y = "Gene_ID",
+            all.x = TRUE), keep.rownames = TRUE)
+results_dmg_lnc <- results_dmg_all[Gene_Type == "lncRNA"]
+
+
+#################### QC CHECKS
+########## 1. IP/INPUT SCATTER PLOTS
+# Extract normalized counts
+input_mat <- extractInput(merip, normalized = TRUE)
+
+ip_mat <- extractIP(
+  merip,
+  normalized = TRUE,
+  adjusted = FALSE
+)
+
+# Match rows and columns
+common_bins <- intersect(
+  rownames(input_mat),
+  rownames(ip_mat)
+)
+
+input_mat <- input_mat[common_bins, , drop = FALSE]
+ip_mat <- ip_mat[common_bins, , drop = FALSE]
+
+# Convert to long format
+plot_data <- data.table(
+  Bins = rep(common_bins, times = ncol(input_mat)),
+  Sample = rep(colnames(input_mat), each = nrow(input_mat)),
+  INPUT = as.vector(input_mat),
+  IP = as.vector(ip_mat)
+)
+plot_data <- plot_data[,c("geneId","Bin") := tstrsplit(Bins,",")]
+
+plot_data_m <-  as.data.table(merge(plot_data,
+            geneType,
+            by.x = "geneId",
+            by.y = "Gene_ID",
+            all.x = TRUE), keep.rownames = TRUE)
+plot_data_m <- plot_data_m[Gene_Type == "lncRNA"]
+
+plot_data_m <- plot_data_m[INPUT > 15 & IP > 15]
+plot_data_m[,Sample1 := ifelse(Sample %in% paste0("Sample_",c(1,2,3,4,5)),
+                          gsub("Sample_","db/+_",Sample),
+                          gsub("Sample_","db/db_",Sample))]
+plot_data_m[,Bins := paste0(geneId,",",Bin)]
+
+pdf(
+  "/radarQC/IP_INPUT_scatter.pdf",
+  width = 12, height = 8
+)
+ggplot(
+  plot_data_m,
+  aes(x = log2(INPUT + 1),
+      y = log2(IP + 1))
+) +
+  geom_point(alpha = 0.35, size = 0.5) +
+  geom_smooth(
+    method = "lm",
+    color = "red",
+    se = FALSE
+  ) +
+   stat_cor(
+    method = "pearson",
+    aes(label = paste(
+      after_stat(r.label),
+      after_stat(p.label),
+      sep = "~`,`~"
+    )),
+    label.x.npc = "left",
+    label.y.npc = "top",
+    size = 3
+  ) +
+  facet_wrap(~factor(Sample1,
+                    levels = unique(plot_data_m[,Sample1]))) +
+  theme_test() +
+  labs(
+    title = "IP versus INPUT abundance",
+    subtitle = "Top filtered lncRNA bins",
+    x = "Log2 normalized INPUT counts",
+    y = "Log2 normalized IP counts"
+  ) +
+  theme(legend.position = "bottom",
+      legend.text = element_text(size = 15,colour = "black"),
+      legend.title = element_text(size = 15,colour = "black"),
+      axis.text = element_text(size = 15,colour = "black"),
+      axis.title = element_text(size = 15,colour = "black"),
+      strip.text = element_text(size = 15,colour = "black"),
+      strip.background = element_rect(fill = "white",colour = "black"))
+dev.off()
+
+########## 2. REPLICATE CORRELATION
+ip_adj <- extractIP(
+  merip,
+  normalized = TRUE,
+  adjusted = TRUE
+)
+ip_adj_f <- ip_adj[rownames(ip_adj) %in% plot_data_m$Bins, , drop = FALSE]
+
+# Log transformation
+log_ip <- as.matrix(log2(ip_adj_f + 1))
+colnames(log_ip) <- unique(plot_data_m[,Sample1])
+
+# Pearson correlation
+cor_matrix <- cor(
+  log_ip,
+  method = "pearson",
+  use = "pairwise.complete.obs"
+)
+
+# Correlation heatmap
+pdf(
+  "/radarQC/Replicate_correlation_heatmap.pdf",
+  width = 8,
+  height = 7
+)
+
+pheatmap(
+  cor_matrix,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  main = "Biological replicate correlation"
+)
+
+dev.off()
+
+########## 3. FERIP
+# Convert RADAR peak coordinates to GRanges
+peak_gr <- GRanges(
+  seqnames = results_dmg_lnc$chr,
+  ranges = IRanges(
+    start = results_dmg_lnc$start,
+    end = results_dmg_lnc$end
+  ),
+  strand = results_dmg_lnc$strand
+)
+
+# Reduce overlapping peaks
+peak_gr <- reduce(peak_gr)
+
+# Obtain BAM files
+input_bams <- Input.files(merip)
+ip_bams <- IP.files(merip)
+
+bam_files <- c(input_bams, ip_bams)
+
+library_names <- c(
+  paste0(samplenames(merip), "_INPUT"),
+  paste0(samplenames(merip), "_IP")
+)
+
+# Calculate reads overlapping peaks
+frip_results <- lapply(seq_along(bam_files), function(i) {
+
+  bam <- BamFile(bam_files[i])
+
+  # Count reads overlapping peaks
+  peak_counts <- summarizeOverlaps(
+    features = peak_gr,
+    reads = bam,
+    mode = "Union",
+    singleEnd = TRUE,
+    fragments = FALSE,
+    ignore.strand = TRUE
+  )
+
+  reads_in_peaks <- sum(
+    assay(peak_counts),
+    na.rm = TRUE
+  )
+
+  # Total mapped reads
+  total_reads <- countBam(bam)$records
+
+  data.frame(
+    Sample = library_names[i],
+    Reads_in_peaks = reads_in_peaks,
+    Total_reads = total_reads,
+    FRiP = reads_in_peaks / total_reads
+  )
+})
+
+frip_df <- bind_rows(frip_results)
+
+pdf(
+  "/radarQC/frip.pdf",
+  width = 8,
+  height = 7
+)
+setDT(frip_df)
+frip_dt <- frip_df[
+                    ,c("Sample1","Num","Library") := tstrsplit(Sample,"_")
+                  ][
+                    ,Sample1 := ifelse(Num %in% c(1,2,3,4,5),
+                          paste0("db/+_",Num),
+                          paste0("db/db_",Num))
+                  ]
+ggplot(frip_df,
+             aes(x = factor(Sample1,
+             levels = unique(plot_data_m[,Sample1])), y = FRiP,
+                 fill = Library)) +
+  geom_bar(stat = "identity",width = 0.6,position = position_dodge()) +
+  scale_fill_manual(
+    values = c("grey70", "steelblue"),
+    labels = c("INPUT", "IP")
+  ) +
+  labs(
+    title = "Fraction of reads in RADAR peaks",
+    x = "Library",
+    y = "FRiP",
+    fill = "Library type"
+  ) +
+  theme_test() +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 15,colour = "black"),
+        legend.title = element_text(size = 15,colour = "black"),
+        axis.text = element_text(size = 15,colour = "black"),
+        axis.title = element_text(size = 15,colour = "black"),
+        axis.text.x = element_text(size = 15,colour = "black",angle = 45, hjust = 1)) +
+  guides(fill = guide_legend(nrow =1))
+dev.off()
